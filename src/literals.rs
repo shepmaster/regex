@@ -43,12 +43,44 @@ pub struct LiteralSearcher {
     matcher: Matcher,
 }
 
+extern crate jetscii;
+use self::jetscii::Bytes;
+
+#[derive(Clone, Debug)]
+pub struct JetsciiSet {
+    chars: Bytes,
+    literals: Vec<u8>,
+}
+
+impl JetsciiSet {
+    fn new(bytes: Vec<u8>) -> JetsciiSet {
+        JetsciiSet {
+            chars: Bytes::from_slice(&bytes),
+            literals: bytes,
+        }
+    }
+
+    fn find(&self, haystack: &[u8]) -> Option<usize> {
+        self.chars.find(haystack)
+    }
+
+    fn count(&self) -> usize {
+        self.literals.len()
+    }
+
+    fn approximate_size(&self) -> usize {
+        self.literals.len() * mem::size_of::<u8>()
+    }
+}
+
 #[derive(Clone, Debug)]
 enum Matcher {
     /// No literals. (Never advances through the input.)
     Empty,
     /// A set of four or more single byte literals.
     Bytes(SingleByteSet),
+    /// A set of 16 or less single byte literals.
+    FastBytes(JetsciiSet),
     /// A single substring. (Likely using Boyer-Moore with memchr.)
     Single(SingleSearch),
     /// An Aho-Corasick automaton.
@@ -102,6 +134,7 @@ impl LiteralSearcher {
         match self.matcher {
             Empty => Some((0, 0)),
             Bytes(ref sset) => sset.find(haystack).map(|i| (i, i + 1)),
+            FastBytes(ref jetscii_set) => jetscii_set.find(haystack).map(|i| (i, i + 1)),
             Single(ref s) => s.find(haystack).map(|i| (i, i + s.len())),
             AC(ref aut) => aut.find(haystack).next().map(|m| (m.start, m.end)),
             Teddy128(ref ted) => ted.find(haystack).map(|m| (m.start, m.end)),
@@ -139,6 +172,9 @@ impl LiteralSearcher {
         match self.matcher {
             Matcher::Empty => LiteralIter::Empty,
             Matcher::Bytes(ref sset) => LiteralIter::Bytes(&sset.dense),
+            Matcher::FastBytes(ref jetscii_set) => {
+                LiteralIter::FastBytes(&jetscii_set.literals)
+            },
             Matcher::Single(ref s) => LiteralIter::Single(&s.pat),
             Matcher::AC(ref ac) => LiteralIter::AC(ac.patterns()),
             Matcher::Teddy128(ref ted) => {
@@ -168,6 +204,7 @@ impl LiteralSearcher {
         match self.matcher {
             Empty => 0,
             Bytes(ref sset) => sset.dense.len(),
+            FastBytes(ref jetscii_set) => jetscii_set.count(),
             Single(_) => 1,
             AC(ref aut) => aut.len(),
             Teddy128(ref ted) => ted.len(),
@@ -180,6 +217,7 @@ impl LiteralSearcher {
         match self.matcher {
             Empty => 0,
             Bytes(ref sset) => sset.approximate_size(),
+            FastBytes(ref jetscii_set) => jetscii_set.approximate_size(),
             Single(ref single) => single.approximate_size(),
             AC(ref aut) => aut.heap_bytes(),
             Teddy128(ref ted) => ted.approximate_size(),
@@ -212,6 +250,10 @@ impl Matcher {
             return Matcher::Empty;
         }
         if sset.complete {
+            if let 2...16 = sset.dense.len() {
+                return Matcher::FastBytes(JetsciiSet::new(sset.dense));
+            }
+
             return Matcher::Bytes(sset);
         }
         if lits.literals().len() == 1 {
@@ -234,6 +276,7 @@ impl Matcher {
 pub enum LiteralIter<'a> {
     Empty,
     Bytes(&'a [u8]),
+    FastBytes(&'a [u8]),
     Single(&'a [u8]),
     AC(&'a [syntax::Lit]),
     Teddy128(&'a [Vec<u8>]),
@@ -245,7 +288,8 @@ impl<'a> Iterator for LiteralIter<'a> {
     fn next(&mut self) -> Option<Self::Item> {
         match *self {
             LiteralIter::Empty => None,
-            LiteralIter::Bytes(ref mut many) => {
+            LiteralIter::Bytes(ref mut many) |
+            LiteralIter::FastBytes(ref mut many) => {
                 if many.is_empty() {
                     None
                 } else {
